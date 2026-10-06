@@ -3,6 +3,7 @@
 venv/
 __pycache__/
 backtest_cache/
+backtest_*.csv
 *.py[cod]
 *.log
 .pytest_cache/

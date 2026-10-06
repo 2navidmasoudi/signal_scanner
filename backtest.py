@@ -220,7 +220,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def rank_key(signal: Signal) -> tuple[int, int, float, float]:
-    return (signal.score, len(signal.price_action_confirmations), signal.volume_ratio, signal.adx)
+    return (signal.raw_score, len(signal.price_action_confirmations), signal.volume_ratio, signal.adx)
 
 
 def signal_candidates_at(

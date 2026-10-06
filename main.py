@@ -182,6 +182,7 @@ class Signal:
     candle_timestamp: int
     side: str
     score: int
+    raw_score: int
     price: float
     stop: float
     target_1: float
@@ -195,6 +196,8 @@ class Signal:
     frvp_position: str
     price_action_context: tuple[str, ...]
     price_action_confirmations: tuple[str, ...]
+    price_action_conflicts: tuple[str, ...]
+    indicator_context: tuple[str, ...]
     reasons: tuple[str, ...]
     filter_failures: tuple[str, ...]
 
@@ -249,9 +252,95 @@ def rsi(values: np.ndarray, period: int = 14) -> float:
     return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
 
 
-def atr_and_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[float, float]:
+def money_flow_index(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int = 14) -> float:
+    if len(close) <= period:
+        return float("nan")
+    typical = (high + low + close) / 3.0
+    raw_flow = typical * volume
+    changes = np.diff(typical)[-period:]
+    flows = raw_flow[1:][-period:]
+    positive = float(np.sum(flows[changes > 0]))
+    negative = float(np.sum(flows[changes < 0]))
+    if negative <= 0:
+        return 100.0 if positive > 0 else 50.0
+    ratio = positive / negative
+    return 100.0 - 100.0 / (1.0 + ratio)
+
+
+def on_balance_volume_side(close: np.ndarray, volume: np.ndarray, lookback: int = 10) -> str | None:
+    if len(close) <= lookback:
+        return None
+    changes = np.diff(close[-lookback - 1:])
+    signed_volume = np.sign(changes) * volume[-lookback:]
+    flow = float(np.sum(signed_volume))
+    return "LONG" if flow > 0 else "SHORT" if flow < 0 else None
+
+
+def session_vwap(rows: np.ndarray) -> float:
+    if rows.ndim != 2 or len(rows) == 0:
+        return float("nan")
+    day_ms = 86_400_000
+    session_start = int(rows[-1, 0]) // day_ms * day_ms
+    session = rows[rows[:, 0] >= session_start]
+    typical = (session[:, 2] + session[:, 3] + session[:, 4]) / 3.0
+    volume = session[:, 5]
+    total_volume = float(np.sum(volume))
+    return float(np.dot(typical, volume) / total_volume) if total_volume > 0 else float("nan")
+
+
+def kdj(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 9) -> tuple[float, float, float, bool, bool]:
+    """Return the latest K/D/J and whether K crossed above or below D."""
+    if len(close) < period:
+        return float("nan"), float("nan"), float("nan"), False, False
+    start = max(period - 1, len(close) - 64)
+    k_value = d_value = 50.0
+    previous_k = previous_d = 50.0
+    for index in range(start, len(close)):
+        highest = float(np.max(high[index - period + 1:index + 1]))
+        lowest = float(np.min(low[index - period + 1:index + 1]))
+        rsv = 50.0 if highest <= lowest else 100.0 * (close[index] - lowest) / (highest - lowest)
+        previous_k, previous_d = k_value, d_value
+        k_value = (2.0 * k_value + rsv) / 3.0
+        d_value = (2.0 * d_value + k_value) / 3.0
+    j_value = 3.0 * k_value - 2.0 * d_value
+    bullish_cross = k_value > d_value and previous_k <= previous_d
+    bearish_cross = k_value < d_value and previous_k >= previous_d
+    return k_value, d_value, j_value, bullish_cross, bearish_cross
+
+
+def ichimoku_state(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> tuple[str | None, float, float, float, float]:
+    """Return standard 9/26/52 Ichimoku values and the visible cloud direction."""
+    if len(close) < 78:
+        return None, *(float("nan"),) * 4
+
+    def midpoint(end: int, period: int) -> float:
+        begin = end - period + 1
+        return (float(np.max(high[begin:end + 1])) + float(np.min(low[begin:end + 1]))) / 2.0
+
+    last = len(close) - 1
+    conversion = midpoint(last, 9)
+    base = midpoint(last, 26)
+    cloud_source = last - 26
+    leading_a = (midpoint(cloud_source, 9) + midpoint(cloud_source, 26)) / 2.0
+    leading_b = midpoint(cloud_source, 52)
+    cloud_top, cloud_bottom = max(leading_a, leading_b), min(leading_a, leading_b)
+    if close[-1] > cloud_top and conversion > base:
+        side = "LONG"
+    elif close[-1] < cloud_bottom and conversion < base:
+        side = "SHORT"
+    else:
+        side = None
+    return side, conversion, base, leading_a, leading_b
+
+
+def atr_adx_dmi(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> tuple[float, float, float, float]:
     if len(close) < period + 2:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
     previous_close = close[:-1]
     true_range = np.maximum.reduce((high[1:] - low[1:], np.abs(high[1:] - previous_close), np.abs(low[1:] - previous_close)))
     up_move = np.diff(high)
@@ -283,7 +372,7 @@ def atr_and_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: in
     dx[valid_dx] = 100.0 * np.abs(plus_di[valid_dx] - minus_di[valid_dx]) / denominator[valid_dx]
     valid_indexes = np.flatnonzero(np.isfinite(dx))
     if len(valid_indexes) < period:
-        return atr_value, float("nan")
+        return atr_value, float("nan"), float(plus_di[-1]), float(minus_di[-1])
     first_adx_index = valid_indexes[period - 1]
     adx_series = np.full(dx.shape, np.nan, dtype=float)
     initial_dx_indexes = valid_indexes[:period]
@@ -293,7 +382,12 @@ def atr_and_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: in
             adx_series[index] = ((adx_series[index - 1] * (period - 1)) + dx[index]) / period
         elif np.isfinite(adx_series[index - 1]):
             adx_series[index] = adx_series[index - 1]
-    return atr_value, float(adx_series[-1])
+    return atr_value, float(adx_series[-1]), float(plus_di[-1]), float(minus_di[-1])
+
+
+def atr_and_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[float, float]:
+    atr_value, adx_value, _, _ = atr_adx_dmi(high, low, close, period)
+    return atr_value, adx_value
 
 
 def confirmed_swings(high: np.ndarray, low: np.ndarray, radius: int = 2) -> tuple[list[int], list[int]]:
@@ -305,6 +399,121 @@ def confirmed_swings(high: np.ndarray, low: np.ndarray, radius: int = 2) -> tupl
         if low[index] < np.min(low[index - radius : index]) and low[index] < np.min(low[index + 1 : index + radius + 1]):
             swing_lows.append(index)
     return swing_highs, swing_lows
+
+
+def detect_macd_divergence(
+    high: np.ndarray,
+    low: np.ndarray,
+    macd_line: np.ndarray,
+    swing_points: tuple[list[int], list[int]],
+    lookback: int = 60,
+) -> tuple[str | None, str | None]:
+    """Find a regular divergence using the last two confirmed price pivots."""
+    count = len(macd_line)
+    swing_highs, swing_lows = swing_points
+    recent_highs = [index for index in swing_highs if index >= count - lookback and math.isfinite(macd_line[index])]
+    recent_lows = [index for index in swing_lows if index >= count - lookback and math.isfinite(macd_line[index])]
+    events: list[tuple[int, str, str]] = []
+    if len(recent_lows) >= 2:
+        first, second = recent_lows[-2:]
+        if count - 1 - second <= 10 and low[second] < low[first] and macd_line[second] > macd_line[first]:
+            events.append((second, "LONG", "MACD bullish divergence"))
+    if len(recent_highs) >= 2:
+        first, second = recent_highs[-2:]
+        if count - 1 - second <= 10 and high[second] > high[first] and macd_line[second] < macd_line[first]:
+            events.append((second, "SHORT", "MACD bearish divergence"))
+    if not events:
+        return None, None
+    _, side, label = max(events, key=lambda event: event[0])
+    return side, label
+
+
+def detect_td_setup(close: np.ndarray, setup_bars: int = 9, comparison_bars: int = 4) -> tuple[str | None, str | None]:
+    """Return a simplified TD Setup 9 only on its completion candle."""
+    if len(close) < setup_bars + comparison_bars:
+        return None, None
+    above = close[comparison_bars:] > close[:-comparison_bars]
+    below = close[comparison_bars:] < close[:-comparison_bars]
+
+    def trailing_count(values: np.ndarray) -> int:
+        total = 0
+        for value in values[::-1]:
+            if not value:
+                break
+            total += 1
+        return total
+
+    buy_count = trailing_count(below)
+    sell_count = trailing_count(above)
+    if buy_count == setup_bars:
+        return "LONG", "TD Buy Setup 9 (simplified proxy)"
+    if sell_count == setup_bars:
+        return "SHORT", "TD Sell Setup 9 (simplified proxy)"
+    return None, None
+
+
+def detect_triangle_breakout(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    atr_value: float,
+    swing_points: tuple[list[int], list[int]],
+    lookback: int = 60,
+) -> tuple[str | None, str | None]:
+    """Heuristic converging-swing triangle; requires a candle close and volume break."""
+    count = len(close)
+    if count < 35 or atr_value <= 0:
+        return None, None
+    swing_highs, swing_lows = swing_points
+    first_allowed = count - lookback
+    highs = [index for index in swing_highs if index >= first_allowed][-3:]
+    lows = [index for index in swing_lows if index >= first_allowed][-3:]
+    if len(highs) < 3 or len(lows) < 3:
+        return None, None
+    if count - 1 - highs[-1] > 15 or count - 1 - lows[-1] > 15:
+        return None, None
+
+    def fit_line(points: list[int], values: np.ndarray) -> tuple[float, float]:
+        x = np.asarray(points, dtype=float)
+        y = values[points].astype(float)
+        x_centered = x - float(np.mean(x))
+        denominator = float(np.dot(x_centered, x_centered))
+        slope = float(np.dot(x_centered, y - float(np.mean(y))) / denominator) if denominator > 0 else 0.0
+        intercept = float(np.mean(y) - slope * np.mean(x))
+        return slope, intercept
+
+    high_slope, high_intercept = fit_line(highs, high)
+    low_slope, low_intercept = fit_line(lows, low)
+    if high_slope >= low_slope:
+        return None, None
+    now_x = count - 1
+    earlier_x = max(0, now_x - 12)
+    upper_now, lower_now = high_slope * now_x + high_intercept, low_slope * now_x + low_intercept
+    upper_previous = high_slope * (now_x - 1) + high_intercept
+    lower_previous = low_slope * (now_x - 1) + low_intercept
+    upper_earlier, lower_earlier = high_slope * earlier_x + high_intercept, low_slope * earlier_x + low_intercept
+    width_now, width_earlier = upper_now - lower_now, upper_earlier - lower_earlier
+    if width_now <= 0 or width_earlier <= 0 or width_now >= width_earlier * 0.90:
+        return None, None
+    average_volume = float(np.mean(volume[-21:-1])) if len(volume) >= 21 else 0.0
+    volume_ratio = float(volume[-1] / average_volume) if average_volume > 0 else 0.0
+    if volume_ratio < 1.2:
+        return None, None
+    if (
+        close[-2] <= upper_previous + 0.05 * atr_value
+        and close[-1] > upper_now + 0.05 * atr_value
+        and close[-1] > open_[-1]
+    ):
+        return "LONG", "Triangle breakout LONG (heuristic, volume confirmed)"
+    if (
+        close[-2] >= lower_previous - 0.05 * atr_value
+        and close[-1] < lower_now - 0.05 * atr_value
+        and close[-1] < open_[-1]
+    ):
+        return "SHORT", "Triangle breakout SHORT (heuristic, volume confirmed)"
+    return None, None
 
 
 def calculate_fixed_range_volume_profile(
@@ -475,12 +684,13 @@ def detect_structure_breaks(
     close: np.ndarray,
     atr_value: float,
     lookback: int = 30,
+    swing_points: tuple[list[int], list[int]] | None = None,
 ) -> tuple[StructureBreak, ...]:
     """Detect recent close-throughs of confirmed swings and classify BOS/CHoCH mechanically."""
     count = len(close)
     if count < 15 or atr_value <= 0:
         return ()
-    swing_highs, swing_lows = confirmed_swings(high, low)
+    swing_highs, swing_lows = swing_points if swing_points is not None else confirmed_swings(high, low)
     radius = 2
     breaks: list[StructureBreak] = []
 
@@ -810,7 +1020,7 @@ def compute_signal(
     price = float(entry_close[-1])
     if price <= 0:
         return None, "Invalid closing price"
-    atr_value, adx_value = atr_and_adx(entry_high, entry_low, entry_close)
+    atr_value, adx_value, plus_di, minus_di = atr_adx_dmi(entry_high, entry_low, entry_close)
     rsi_value = rsi(entry_close)
     if not all(math.isfinite(value) for value in (atr_value, adx_value, rsi_value)) or atr_value <= 0:
         return None, "ATR, ADX, or RSI calculation unavailable"
@@ -823,9 +1033,12 @@ def compute_signal(
         config.frvp_rows,
         config.frvp_value_area_percent,
     )
+    swing_points = confirmed_swings(entry_high, entry_low)
     ict_side, ict_reason = detect_ict_first_retest(entry_open, entry_high, entry_low, entry_close, atr_value)
     rtm_side, rtm_reason = detect_rtm_first_return(entry_open, entry_high, entry_low, entry_close, atr_value)
-    structure_breaks = detect_structure_breaks(entry_open, entry_high, entry_low, entry_close, atr_value)
+    structure_breaks = detect_structure_breaks(
+        entry_open, entry_high, entry_low, entry_close, atr_value, swing_points=swing_points
+    )
     price_action_patterns: list[PriceActionPattern] = []
     if ict_side and ict_reason:
         price_action_patterns.append(PriceActionPattern(ict_side, ict_reason))
@@ -848,6 +1061,29 @@ def compute_signal(
     signal_line = ema(macd_line[np.isfinite(macd_line)], 9)
     macd_hist = float(macd_line[np.isfinite(macd_line)][-1] - signal_line[-1]) if len(signal_line) else 0.0
     previous_hist = float(macd_line[np.isfinite(macd_line)][-2] - signal_line[-2]) if len(signal_line) > 1 else macd_hist
+
+    sma_fast = float(np.mean(entry_close[-20:]))
+    sma_slow = float(np.mean(entry_close[-50:]))
+    ichimoku_side, conversion_line, base_line, leading_span_a, leading_span_b = ichimoku_state(
+        entry_high, entry_low, entry_close
+    )
+    mfi_value = money_flow_index(entry_high, entry_low, entry_close, entry_volume)
+    obv_side = on_balance_volume_side(entry_close, entry_volume)
+    vwap_value = session_vwap(entry_rows)
+    k_value, d_value, j_value, kdj_bullish_cross, kdj_bearish_cross = kdj(
+        entry_high, entry_low, entry_close
+    )
+    macd_divergence_side, macd_divergence_label = detect_macd_divergence(
+        entry_high, entry_low, macd_line, swing_points
+    )
+    td_side, td_label = detect_td_setup(entry_close)
+    triangle_side, triangle_label = detect_triangle_breakout(
+        entry_open, entry_high, entry_low, entry_close, entry_volume, atr_value, swing_points
+    )
+    if macd_divergence_side and macd_divergence_label:
+        price_action_patterns.append(PriceActionPattern(macd_divergence_side, macd_divergence_label))
+    if triangle_side and triangle_label:
+        price_action_patterns.append(PriceActionPattern(triangle_side, triangle_label))
 
     lookback = min(20, len(entry_close) - 1)
     prior_high = float(np.max(entry_high[-lookback - 1 : -1]))
@@ -981,12 +1217,90 @@ def compute_signal(
     elif htf_down and entry_fast[-1] > entry_slow[-1]:
         long_score -= 8
 
+    indicator_labels: dict[str, list[str]] = {"LONG": [], "SHORT": []}
+    indicator_votes: dict[str, dict[str, list[str]]] = {
+        side: {"trend": [], "flow": [], "momentum": [], "pattern": []}
+        for side in ("LONG", "SHORT")
+    }
+
+    def add_indicator(side: str | None, group: str, label: str) -> None:
+        if side in indicator_votes:
+            indicator_votes[side][group].append(label)
+            indicator_labels[side].append(label)
+
+    if sma_fast > sma_slow and price > sma_fast:
+        add_indicator("LONG", "trend", f"SMA20/50 bullish ({sma_fast:.6g}/{sma_slow:.6g})")
+    elif sma_fast < sma_slow and price < sma_fast:
+        add_indicator("SHORT", "trend", f"SMA20/50 bearish ({sma_fast:.6g}/{sma_slow:.6g})")
+    if ichimoku_side:
+        if ichimoku_side == "LONG":
+            add_indicator(
+                "LONG", "trend",
+                f"Ichimoku bullish: Tenkan {conversion_line:.6g} > Kijun {base_line:.6g}; "
+                f"Span A/B {leading_span_a:.6g}/{leading_span_b:.6g}",
+            )
+        else:
+            add_indicator(
+                "SHORT", "trend",
+                f"Ichimoku bearish: Tenkan {conversion_line:.6g} < Kijun {base_line:.6g}; "
+                f"Span A/B {leading_span_a:.6g}/{leading_span_b:.6g}",
+            )
+    if adx_value >= 18 and plus_di > minus_di:
+        add_indicator("LONG", "trend", f"DMI +DI leads ({plus_di:.0f} vs {minus_di:.0f})")
+    elif adx_value >= 18 and minus_di > plus_di:
+        add_indicator("SHORT", "trend", f"DMI -DI leads ({minus_di:.0f} vs {plus_di:.0f})")
+    if math.isfinite(vwap_value):
+        if price > vwap_value:
+            add_indicator("LONG", "trend", f"Above UTC session VWAP ({vwap_value:.6g})")
+        elif price < vwap_value:
+            add_indicator("SHORT", "trend", f"Below UTC session VWAP ({vwap_value:.6g})")
+    if math.isfinite(mfi_value):
+        if mfi_value >= 55:
+            add_indicator("LONG", "flow", f"MFI bullish ({mfi_value:.0f})")
+        elif mfi_value <= 45:
+            add_indicator("SHORT", "flow", f"MFI bearish ({mfi_value:.0f})")
+    if obv_side:
+        add_indicator(obv_side, "flow", f"OBV {obv_side.lower()} volume flow")
+    if kdj_bullish_cross or (math.isfinite(k_value) and math.isfinite(d_value) and k_value > d_value and j_value < 100):
+        add_indicator("LONG", "momentum", f"KDJ bullish (K {k_value:.0f}, D {d_value:.0f}, J {j_value:.0f})")
+    elif kdj_bearish_cross or (math.isfinite(k_value) and math.isfinite(d_value) and k_value < d_value and j_value > 0):
+        add_indicator("SHORT", "momentum", f"KDJ bearish (K {k_value:.0f}, D {d_value:.0f}, J {j_value:.0f})")
+    if macd_divergence_side and macd_divergence_label:
+        add_indicator(macd_divergence_side, "momentum", macd_divergence_label)
+    if td_side and td_label:
+        add_indicator(td_side, "momentum", td_label)
+    if triangle_side and triangle_label:
+        add_indicator(triangle_side, "pattern", triangle_label)
+
+    def confirmation_bonus(side: str) -> int:
+        groups = indicator_votes[side]
+        trend_count = len(groups["trend"])
+        flow_count = len(groups["flow"])
+        momentum_count = len(groups["momentum"])
+        return min(
+            8,
+            (3 if trend_count >= 2 else 1 if trend_count == 1 else 0)
+            + (2 if flow_count >= 2 else 1 if flow_count == 1 else 0)
+            + (3 if momentum_count >= 2 else 1 if momentum_count == 1 else 0)
+            + (2 if groups["pattern"] else 0),
+        )
+
+    long_score += confirmation_bonus("LONG")
+    short_score += confirmation_bonus("SHORT")
+
     if long_score == short_score:
         return None, None
     side = "LONG" if long_score > short_score else "SHORT"
-    score = max(0, min(100, long_score if side == "LONG" else short_score))
+    raw_score = long_score if side == "LONG" else short_score
+    score = max(0, min(100, raw_score))
     aligned_patterns = tuple(
         pattern.label for pattern in price_action_patterns if pattern.side == side and pattern.confirmed
+    )
+    aligned_context = tuple(pattern.label for pattern in price_action_patterns if pattern.side == side)
+    opposing_patterns = tuple(
+        pattern.label
+        for pattern in price_action_patterns
+        if pattern.side != side and pattern.confirmed
     )
     confirmed_breakout = breakout_side == side and volume_ratio >= config.breakout_volume_ratio
     filter_failures: list[str] = []
@@ -1019,6 +1333,7 @@ def compute_signal(
         candle_timestamp=int(entry_rows[-1, 0]),
         side=side,
         score=score,
+        raw_score=raw_score,
         price=current_price,
         stop=stop,
         target_1=target_1,
@@ -1030,9 +1345,11 @@ def compute_signal(
         entry_drift_atr=entry_drift_atr,
         frvp_profile=frvp_profile,
         frvp_position=frvp_position,
-        price_action_context=tuple(pattern.label for pattern in price_action_patterns),
+        price_action_context=aligned_context,
         price_action_confirmations=aligned_patterns,
-        reasons=reasons,
+        price_action_conflicts=opposing_patterns,
+        indicator_context=tuple(indicator_labels[side]),
+        reasons=tuple(reasons + tuple(indicator_labels[side])),
         filter_failures=tuple(filter_failures),
     )
     return signal, None
@@ -1102,7 +1419,7 @@ async def scan(exchange: Any, config: Config, markets: dict[str, dict[str, Any]]
     signals.sort(
         key=lambda item: (
             is_qualified(item, config),
-            item.score,
+            item.raw_score,
             len(item.price_action_confirmations),
             item.volume_ratio,
             item.adx,
@@ -1172,34 +1489,49 @@ def render_console(result: ScanResult, config: Config, cycle: int, elapsed: floa
         score_style = "bold green" if qualified else "red" if signal.filter_failures else "yellow"
         gate = Text("READY", style="bold green") if qualified else Text("BLOCKED", style="bold red") if signal.filter_failures else Text("WATCH", style="yellow")
         price_action = "+".join(
-            f"{reason.split(' ', 1)[0]}{'↑' if ' LONG' in reason else '↓'}"
+            f"{reason.split(' ', 1)[0]}"
+            f"{'↑' if ' LONG' in reason or 'bullish' in reason.lower() else '↓'}"
             for reason in signal.price_action_context
         ) or "—"
         table.add_row(
             str(rank), signal.requested_symbol, Text(f"{'🟢' if signal.side == 'LONG' else '🔴'} {signal.side}", style=side_style),
-            Text(f"{signal.score}/100", style=score_style), f"{signal.rsi:.1f}", f"{signal.adx:.1f}",
+            Text(f"{signal.score}/100{'*' if signal.raw_score > 100 else ''}", style=score_style), f"{signal.rsi:.1f}", f"{signal.adx:.1f}",
             f"{signal.volume_ratio:.2f}x", price_action, signal.frvp_position, gate, format_price(signal.price),
         )
     if not result.signals:
         table.add_row("—", "No valid candidates", "—", "—", "—", "—", "—", "—", "—", "—", "—")
     console.print(table)
+    if any(signal.raw_score > 100 for signal in result.signals[:12]):
+        console.print("[dim]* Score display is capped at 100; raw heuristic score is used to rank capped setups.[/dim]")
 
     best = best_qualified_signal(result, config)
     candidate = result.signals[0] if result.signals else None
     if best:
+        score_display = f"Score {best.score}/100"
+        if best.raw_score > 100:
+            score_display += f" (raw {best.raw_score}; capped)"
+        counter_line = (
+            f"⚠️ Counter-signals: {' · '.join(best.price_action_conflicts)}\n"
+            if best.price_action_conflicts else ""
+        )
         console.print(Panel(
             f"[bold]{'🚀 LONG' if best.side == 'LONG' else '🔻 SHORT'} {best.requested_symbol}[/bold]  "
-            f"[bold bright_green]Score {best.score}/100[/bold bright_green]\n"
+            f"[bold bright_green]{score_display}[/bold bright_green]\n"
             f"💵 Entry: {format_price(best.price)}   🛡️ Stop: {format_price(best.stop)}\n"
             f"🎯 TP1: {format_price(best.target_1)}   🎯 TP2: {format_price(best.target_2)}\n"
             f"🧠 Price action: {' · '.join(best.price_action_context) or 'None detected; advisory only'}\n"
+            f"{counter_line}"
+            f"📈 Indicators: {' · '.join(best.indicator_context) or 'Mixed'}\n"
             f"📦 FRVP: {format_frvp(best.frvp_profile, best.frvp_position)}\n"
             f"🧩 {' · '.join(best.reasons[:8])}", title="✨ Best Qualified Setup", border_style="green",
         ))
     elif candidate:
         blocked_by = "; ".join(candidate.filter_failures) or f"Score below {config.min_signal_score}/100"
+        candidate_score = f"{candidate.score}/100"
+        if candidate.raw_score > 100:
+            candidate_score += f" (raw {candidate.raw_score}; capped)"
         console.print(Panel(
-            f"🟡 Best candidate: [bold]{candidate.requested_symbol}[/bold] ({candidate.side}, {candidate.score}/100)\n"
+            f"🟡 Best candidate: [bold]{candidate.requested_symbol}[/bold] ({candidate.side}, {candidate_score})\n"
             f"📦 FRVP: {format_frvp(candidate.frvp_profile, candidate.frvp_position)}\n"
             f"🛑 Blocked by: {blocked_by}\n[dim]No trade signal.[/dim]",
             title="⏸️ NO TRADE", border_style="yellow",
@@ -1236,23 +1568,33 @@ def telegram_message(
     candidate = result.signals[0] if result.signals else None
     if best:
         emoji = "🟢🚀" if best.side == "LONG" else "🔴🔻"
+        score_note = (
+            f" (raw heuristic score {best.raw_score}; display capped at 100)"
+            if best.raw_score > 100 else ""
+        )
         lines.extend([
             f"{emoji} <b>{best.side} — {esc(best.requested_symbol)}</b>",
-            f"💯 Setup score: <b>{best.score}/100</b> <i>(rule-based score, not a win probability)</i>",
+            f"💯 Setup score: <b>{best.score}/100</b> <i>(rule-based score, not a win probability){esc(score_note)}</i>",
             f"💵 Entry reference: <code>{format_price(best.price)}</code>",
             f"🛡️ ATR stop reference: <code>{format_price(best.stop)}</code>",
             f"🎯 Target 1: <code>{format_price(best.target_1)}</code>",
             f"🎯 Target 2: <code>{format_price(best.target_2)}</code>",
             f"🧠 Price action: {esc(' · '.join(best.price_action_context) or 'None detected; advisory only')}",
+            f"📈 Indicators: {esc(' · '.join(best.indicator_context) or 'Mixed')}",
             f"📦 FRVP: <code>{esc(format_frvp(best.frvp_profile, best.frvp_position))}</code>",
             f"📊 RSI: {best.rsi:.1f} | ADX: {best.adx:.1f} | Volume: {best.volume_ratio:.2f}x | Entry drift: {best.entry_drift_atr:.2f} ATR",
             f"🧩 <b>Confluence:</b> {esc(' · '.join(best.reasons[:8]) or 'Mixed technical conditions')}",
         ])
+        if best.price_action_conflicts:
+            lines.append(f"⚠️ <b>Counter-signals:</b> {esc(' · '.join(best.price_action_conflicts))}")
     elif candidate:
         blocked_by = "; ".join(candidate.filter_failures) or f"Score below {config.min_signal_score}/100"
+        candidate_score = f"{candidate.score}/100"
+        if candidate.raw_score > 100:
+            candidate_score += f" (raw {candidate.raw_score}; capped)"
         lines.extend([
             "⏸️ <b>NO TRADE — no candidate passed all quality checks</b>",
-            f"👀 Best candidate: <b>{esc(candidate.requested_symbol)}</b> · {candidate.side} · {candidate.score}/100",
+            f"👀 Best candidate: <b>{esc(candidate.requested_symbol)}</b> · {candidate.side} · {esc(candidate_score)}",
             f"📦 FRVP: <code>{esc(format_frvp(candidate.frvp_profile, candidate.frvp_position))}</code>",
             f"🛑 Blocked by: {esc(blocked_by)}",
         ])
@@ -1270,7 +1612,15 @@ def telegram_message(
 
 
 def telegram_dedupe_key(signal: Signal) -> str:
-    return f"SIGNAL:{signal.requested_symbol}:{signal.side}:{signal.candle_timestamp}"
+    # Keep one alert per continuous symbol/direction setup, not one per candle.
+    return f"SIGNAL:{signal.requested_symbol}:{signal.side}"
+
+
+def telegram_key_matches_signal(key: str | None, signal_key: str) -> bool:
+    if key == signal_key:
+        return True
+    # Accept keys written by the previous per-candle dedupe format.
+    return bool(key and key.startswith(f"{signal_key}:"))
 
 
 def load_telegram_state() -> tuple[str | None, list[str], str | None, int | None]:
@@ -1406,7 +1756,9 @@ async def run() -> None:
                         pending_signals = [
                             signal
                             for signal in ready_signals
-                            if telegram_dedupe_key(signal) not in sent_signal_keys
+                            if not telegram_key_matches_signal(
+                                last_telegram_key, telegram_dedupe_key(signal)
+                            )
                         ]
                         send_failed = False
                         for signal in pending_signals:
@@ -1431,7 +1783,7 @@ async def run() -> None:
                             else:
                                 send_failed = True
                         if not pending_signals:
-                            logger.info("Best READY setup was already sent for its signal candle")
+                            logger.info("Best READY setup was already sent and remains active")
                         elif send_failed:
                             logger.warning("Some READY Telegram setups failed; failed sends will retry next cycle")
                         if last_notification_state != "READY":
