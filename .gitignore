@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+__pycache__/
+backtest_cache/
+backtest.py
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+scanner_state.json
+scanner_state.tmp

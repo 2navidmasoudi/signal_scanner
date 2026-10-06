@@ -1,0 +1,5 @@
+ccxt>=4.4
+aiohttp>=3.9
+numpy>=1.26
+python-dotenv>=1.0
+rich>=13.7
